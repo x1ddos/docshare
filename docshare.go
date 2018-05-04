@@ -21,11 +21,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 )
@@ -74,20 +72,26 @@ func main() {
 			ch <- struct{}{}
 			wg.Add(1)
 			go func(id string, body []byte) {
+				// TODO: figure out a better way to create context for each goroutine.
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 				defer func() {
+					cancel()
 					<-ch
 					wg.Done()
 				}()
-				url := fmt.Sprintf("%s/files/%s/permissions?%s", driveAPI, id, params.Encode())
-				resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+				u := fmt.Sprintf("%s/files/%s/permissions?%s", driveAPI, id, params.Encode())
+				r, err := http.NewRequest("POST", u, bytes.NewReader(body))
 				if err != nil {
-					log.Printf("error posting to %s for doc %s: %v (%v)", url, id, err, resp.StatusCode)
+					log.Printf("%s: %v", id, err)
 					return
 				}
-				defer resp.Body.Close()
-				if resp.StatusCode != 200 {
-					log.Printf("%s: %v", id, errorResponse(resp))
+				r.Header.Set("Content-Type", "application/json")
+				res, err := doRetry(ctx, client, r)
+				if err != nil {
+					log.Printf("%s: %v", id, err)
+					return
 				}
+				res.Body.Close()
 			}(id, body)
 		}
 	}
@@ -118,15 +122,12 @@ func main() {
 					log.Printf("error building delete req %s for doc %s: %v", u, docID, err)
 					return
 				}
-				resp, err := client.Do(req.WithContext(ctx))
+				resp, err := doRetry(ctx, client, req)
 				if err != nil {
-					log.Printf("error deleting perm %s for doc %s: %v (%v)", u, docID, err, resp.StatusCode)
+					log.Printf("%s: %v", docID, err)
 					return
 				}
-				defer resp.Body.Close()
-				if resp.StatusCode != 200 && resp.StatusCode != 204 {
-					log.Printf("%s: %v", docID, errorResponse(resp))
-				}
+				resp.Body.Close()
 			}(id)
 		}
 	}
@@ -159,7 +160,7 @@ func fetchPermission(ctx context.Context, client *http.Client, docID, email stri
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.Do(r.WithContext(ctx))
+	resp, err := doRetry(ctx, client, r)
 	if err != nil {
 		return nil, err
 	}
@@ -188,23 +189,43 @@ func fetchPermission(ctx context.Context, client *http.Client, docID, email stri
 	return fetchPermission(ctx, client, docID, email, pageToken(p.NextPageToken))
 }
 
-func errorResponse(res *http.Response) error {
-	var e struct {
-		Error struct {
-			Errors []struct{ Message string }
+func doRetry(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
+	var nretry int
+	for {
+		res, err := client.Do(req.WithContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode >= 200 && res.StatusCode <= 299 {
+			return res, nil
+		}
+
+		err = errorResponse(res)
+		res.Body.Close()
+		if !isRetriable(res.StatusCode, err) {
+			return nil, err
+		}
+		nretry++
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff(nretry)):
+			// Retry.
 		}
 	}
-	b, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return errors.New(res.Status)
+}
+
+func backoff(n int) time.Duration {
+	const max = 10 * time.Second
+	if n < 0 {
+		n = 0
 	}
-	err = json.Unmarshal(b, &e)
-	if err != nil || len(e.Error.Errors) == 0 {
-		return fmt.Errorf("%s: %s", res.Status, b)
+	if n > 30 {
+		n = 30
 	}
-	var a []string
-	for _, v := range e.Error.Errors {
-		a = append(a, v.Message)
+	d := time.Duration(1<<uint(n)) * time.Second
+	if d > max {
+		d = max
 	}
-	return errors.New(strings.Join(a, "; "))
+	return d
 }
