@@ -91,7 +91,7 @@ func main() {
 					log.Printf("%s: %v", id, err)
 					return
 				}
-				res.Body.Close()
+				defer res.Body.Close()
 			}(id, body)
 		}
 	}
