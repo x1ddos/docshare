@@ -77,9 +77,8 @@ func isRetriable(status int, err error) bool {
 		return false
 	}
 	for _, v := range ae.Errors {
-		if v.Reason == "userRateLimitExceeded" ||
-			v.Reason == "rateLimitExceeded" ||
-			v.Reason == "sharingRateLimitExceeded" {
+		switch v.Reason {
+		case "userRateLimitExceeded", "rateLimitExceeded", "sharingRateLimitExceeded":
 			return true
 		}
 	}
